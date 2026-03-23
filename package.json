@@ -2,6 +2,11 @@
   "name": "Rootstock_project",
   "version": "1.0.0",
   "type": "module",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "node": "hardhat node"
+  },
   "devDependencies": {
     "@nomicfoundation/hardhat-ethers": "^4.0.6",
     "@nomicfoundation/hardhat-ignition": "^0.15.16",
