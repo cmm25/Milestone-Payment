@@ -20,3 +20,6 @@
 /coverage
 # env file
 .env
+
+# Replit chat attachments
+attached_assets/
