@@ -1,0 +1,650 @@
+import { expect } from "chai";
+import { ethers } from "hardhat";
+import { time } from "@nomicfoundation/hardhat-network-helpers";
+import { FreelanceEscrow } from "../typechain-types";
+import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
+
+describe("FreelanceEscrow", function () {
+
+  // -------------------------------------------------------
+  // SHARED VARIABLES
+  // available to every test in this file
+  // -------------------------------------------------------
+  let escrow: FreelanceEscrow;
+  let owner: SignerWithAddress;    // deployer — can pause
+  let client: SignerWithAddress;   // creates and approves projects
+  let freelancer: SignerWithAddress; // submits milestones
+  let stranger: SignerWithAddress; // random wallet — should be rejected everywhere
+
+  // reusable milestone data
+  // these are the inputs createProject expects
+  const descriptions = ["Design mockups", "Frontend build", "Deployment"];
+  const amounts = [
+    ethers.parseEther("0.2"),
+    ethers.parseEther("0.5"),
+    ethers.parseEther("0.3")
+  ];
+  const totalBudget = ethers.parseEther("1.0");
+
+  // helper — returns three deadlines from now
+  // called inside each test so timestamps are always fresh
+  async function getDeadlines() {
+    const now = await time.latest();
+    return [
+      now + 7 * 24 * 60 * 60,   // 7 days
+      now + 14 * 24 * 60 * 60,  // 14 days
+      now + 21 * 24 * 60 * 60   // 21 days
+    ];
+  }
+
+  // helper — creates a project and returns its ID
+  // used in tests that need a project to already exist
+  async function createProject() {
+    const deadlines = await getDeadlines();
+    const tx = await escrow
+      .connect(client)
+      .createProject(
+        freelancer.address,
+        descriptions,
+        amounts,
+        deadlines,
+        { value: totalBudget }
+      );
+    const receipt = await tx.wait();
+
+    // read the projectId from the emitted event
+    const event = receipt?.logs
+      .map((log: any) => {
+        try { return escrow.interface.parseLog(log); }
+        catch { return null; }
+      })
+      .find((e: any) => e?.name === "ProjectCreated");
+
+    return event?.args.projectId;
+  }
+
+  // -------------------------------------------------------
+  // SETUP — runs before every single test
+  // deploys a fresh contract so tests never affect each other
+  // -------------------------------------------------------
+  beforeEach(async function () {
+    [owner, client, freelancer, stranger] = await ethers.getSigners();
+
+    const Factory = await ethers.getContractFactory("FreelanceEscrow");
+    escrow = await Factory.deploy(owner.address) as FreelanceEscrow;
+    await escrow.waitForDeployment();
+  });
+
+  // -------------------------------------------------------
+  // 1. DEPLOYMENT
+  // -------------------------------------------------------
+  describe("Deployment", function () {
+
+    it("sets the correct owner", async function () {
+      // the owner passed to the constructor should be stored
+      expect(await escrow.owner()).to.equal(owner.address);
+    });
+
+    it("starts unpaused", async function () {
+      // contract should be active immediately after deployment
+      expect(await escrow.paused()).to.equal(false);
+    });
+
+  });
+
+  // -------------------------------------------------------
+  // 2. CREATE PROJECT
+  // -------------------------------------------------------
+  describe("createProject", function () {
+
+    it("creates a project and stores it correctly", async function () {
+      const projectId = await createProject();
+
+      const project = await escrow.getProject(projectId);
+
+      expect(project.client).to.equal(client.address);
+      expect(project.freelancer).to.equal(freelancer.address);
+      expect(project.totalBudget).to.equal(totalBudget);
+      expect(project.remainingBudget).to.equal(totalBudget);
+      expect(project.milestoneCount).to.equal(3);
+      expect(project.isActive).to.equal(true);
+    });
+
+    it("stores each milestone correctly", async function () {
+      const projectId = await createProject();
+
+      const milestone = await escrow.getMilestone(projectId, 0);
+
+      expect(milestone.description).to.equal("Design mockups");
+      expect(milestone.amount).to.equal(amounts[0]);
+      expect(milestone.status).to.equal(0); // 0 = PENDING
+      expect(milestone.isPaid).to.equal(false);
+    });
+
+    it("emits ProjectCreated event with correct data", async function () {
+      const deadlines = await getDeadlines();
+
+      await expect(
+        escrow.connect(client).createProject(
+          freelancer.address,
+          descriptions,
+          amounts,
+          deadlines,
+          { value: totalBudget }
+        )
+      ).to.emit(escrow, "ProjectCreated")
+        .withArgs(1, client.address, freelancer.address, totalBudget, 3);
+    });
+
+    it("locks RBTC in the contract", async function () {
+      const before = await ethers.provider.getBalance(await escrow.getAddress());
+      await createProject();
+      const after = await ethers.provider.getBalance(await escrow.getAddress());
+
+      expect(after - before).to.equal(totalBudget);
+    });
+
+    it("reverts if msg.value does not match sum of amounts", async function () {
+      const deadlines = await getDeadlines();
+
+      await expect(
+        escrow.connect(client).createProject(
+          freelancer.address,
+          descriptions,
+          amounts,
+          deadlines,
+          { value: ethers.parseEther("0.5") } // wrong amount
+        )
+      ).to.be.revertedWithCustomError(escrow, "BudgetMismatch");
+    });
+
+    it("reverts if arrays have mismatched lengths", async function () {
+      const deadlines = await getDeadlines();
+      const shortAmounts = [ethers.parseEther("0.5")]; // only one amount
+
+      await expect(
+        escrow.connect(client).createProject(
+          freelancer.address,
+          descriptions,
+          shortAmounts,
+          deadlines,
+          { value: ethers.parseEther("0.5") }
+        )
+      ).to.be.revertedWithCustomError(escrow, "ArrayLengthMismatch");
+    });
+
+    it("reverts if freelancer address is zero", async function () {
+      const deadlines = await getDeadlines();
+
+      await expect(
+        escrow.connect(client).createProject(
+          ethers.ZeroAddress,
+          descriptions,
+          amounts,
+          deadlines,
+          { value: totalBudget }
+        )
+      ).to.be.revertedWith("Invalid freelancer address");
+    });
+
+    it("reverts if client and freelancer are the same address", async function () {
+      const deadlines = await getDeadlines();
+
+      await expect(
+        escrow.connect(client).createProject(
+          client.address, // same as msg.sender
+          descriptions,
+          amounts,
+          deadlines,
+          { value: totalBudget }
+        )
+      ).to.be.revertedWith("Cannot be your own freelancer");
+    });
+
+    it("reverts if any milestone amount is zero", async function () {
+      const deadlines = await getDeadlines();
+      const badAmounts = [
+        ethers.parseEther("0.5"),
+        ethers.parseEther("0"),  // zero amount
+        ethers.parseEther("0.5")
+      ];
+
+      await expect(
+        escrow.connect(client).createProject(
+          freelancer.address,
+          descriptions,
+          badAmounts,
+          deadlines,
+          { value: ethers.parseEther("1.0") }
+        )
+      ).to.be.revertedWithCustomError(escrow, "AmountMustBePositive");
+    });
+
+    it("reverts if deadline is in the past", async function () {
+      const now = await time.latest();
+      const badDeadlines = [
+        now - 100,             // already passed
+        now + 14 * 24 * 60 * 60,
+        now + 21 * 24 * 60 * 60
+      ];
+
+      await expect(
+        escrow.connect(client).createProject(
+          freelancer.address,
+          descriptions,
+          amounts,
+          badDeadlines,
+          { value: totalBudget }
+        )
+      ).to.be.revertedWithCustomError(escrow, "DeadlineMustBeFuture");
+    });
+
+    it("assigns incrementing project IDs", async function () {
+      const id1 = await createProject();
+      const id2 = await createProject();
+
+      expect(id1).to.equal(1);
+      expect(id2).to.equal(2);
+    });
+
+  });
+
+  // -------------------------------------------------------
+  // 3. SUBMIT MILESTONE
+  // -------------------------------------------------------
+  describe("submitMilestone", function () {
+
+    it("changes milestone status from PENDING to SUBMITTED", async function () {
+      const projectId = await createProject();
+
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+
+      const milestone = await escrow.getMilestone(projectId, 0);
+      expect(milestone.status).to.equal(1); // 1 = SUBMITTED
+    });
+
+    it("emits MilestoneSubmitted event", async function () {
+      const projectId = await createProject();
+
+      await expect(
+        escrow.connect(freelancer).submitMilestone(projectId, 0)
+      ).to.emit(escrow, "MilestoneSubmitted")
+        .withArgs(projectId, 0);
+    });
+
+    it("reverts if called by the client", async function () {
+      const projectId = await createProject();
+
+      await expect(
+        escrow.connect(client).submitMilestone(projectId, 0)
+      ).to.be.revertedWithCustomError(escrow, "NotAuthorized");
+    });
+
+    it("reverts if called by a stranger", async function () {
+      const projectId = await createProject();
+
+      await expect(
+        escrow.connect(stranger).submitMilestone(projectId, 0)
+      ).to.be.revertedWithCustomError(escrow, "NotAuthorized");
+    });
+
+    it("reverts if milestone is already submitted", async function () {
+      const projectId = await createProject();
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+
+      // try to submit the same milestone again
+      await expect(
+        escrow.connect(freelancer).submitMilestone(projectId, 0)
+      ).to.be.revertedWith("Milestone not pending");
+    });
+
+    it("reverts if milestone ID does not exist", async function () {
+      const projectId = await createProject();
+
+      await expect(
+        escrow.connect(freelancer).submitMilestone(projectId, 99)
+      ).to.be.revertedWithCustomError(escrow, "MilestoneNotFound");
+    });
+
+    it("reverts if project does not exist", async function () {
+      await expect(
+        escrow.connect(freelancer).submitMilestone(999, 0)
+      ).to.be.revertedWithCustomError(escrow, "ProjectNotFound");
+    });
+
+  });
+
+  // -------------------------------------------------------
+  // 4. APPROVE MILESTONE
+  // -------------------------------------------------------
+  describe("approveMilestone", function () {
+
+    it("changes status to APPROVED and marks isPaid", async function () {
+      const projectId = await createProject();
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+      await escrow.connect(client).approveMilestone(projectId, 0);
+
+      const milestone = await escrow.getMilestone(projectId, 0);
+      expect(milestone.status).to.equal(2); // 2 = APPROVED
+      expect(milestone.isPaid).to.equal(true);
+    });
+
+    it("transfers correct amount to freelancer", async function () {
+      const projectId = await createProject();
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+
+      const before = await ethers.provider.getBalance(freelancer.address);
+      await escrow.connect(client).approveMilestone(projectId, 0);
+      const after = await ethers.provider.getBalance(freelancer.address);
+
+      // freelancer received 0.2 RBTC (amounts[0])
+      // they also spent a tiny amount on gas as a signer but
+      // since client pays the gas here, balance should increase
+      expect(after - before).to.equal(amounts[0]);
+    });
+
+    it("reduces remainingBudget correctly", async function () {
+      const projectId = await createProject();
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+      await escrow.connect(client).approveMilestone(projectId, 0);
+
+      const project = await escrow.getProject(projectId);
+      expect(project.remainingBudget).to.equal(
+        totalBudget - amounts[0]
+      );
+    });
+
+    it("emits MilestoneApproved event", async function () {
+      const projectId = await createProject();
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+
+      await expect(
+        escrow.connect(client).approveMilestone(projectId, 0)
+      ).to.emit(escrow, "MilestoneApproved")
+        .withArgs(projectId, 0, amounts[0]);
+    });
+
+    it("closes project and emits ProjectCompleted when all milestones resolved", async function () {
+      const projectId = await createProject();
+
+      // submit and approve all three milestones
+      for (let i = 0; i < 3; i++) {
+        await escrow.connect(freelancer).submitMilestone(projectId, i);
+        await escrow.connect(client).approveMilestone(projectId, i);
+      }
+
+      const project = await escrow.getProject(projectId);
+      expect(project.isActive).to.equal(false);
+    });
+
+    it("emits ProjectCompleted on final milestone approval", async function () {
+      const projectId = await createProject();
+
+      for (let i = 0; i < 2; i++) {
+        await escrow.connect(freelancer).submitMilestone(projectId, i);
+        await escrow.connect(client).approveMilestone(projectId, i);
+      }
+
+      // third and final milestone
+      await escrow.connect(freelancer).submitMilestone(projectId, 2);
+
+      await expect(
+        escrow.connect(client).approveMilestone(projectId, 2)
+      ).to.emit(escrow, "ProjectCompleted").withArgs(projectId);
+    });
+
+    it("reverts if called by the freelancer", async function () {
+      const projectId = await createProject();
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+
+      await expect(
+        escrow.connect(freelancer).approveMilestone(projectId, 0)
+      ).to.be.revertedWithCustomError(escrow, "NotAuthorized");
+    });
+
+    it("reverts if milestone is still PENDING", async function () {
+      const projectId = await createProject();
+
+      // milestone was never submitted
+      await expect(
+        escrow.connect(client).approveMilestone(projectId, 0)
+      ).to.be.revertedWith("Milestone not submitted");
+    });
+
+    it("reverts if milestone already approved", async function () {
+      const projectId = await createProject();
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+      await escrow.connect(client).approveMilestone(projectId, 0);
+
+      // try to approve again
+      await expect(
+        escrow.connect(client).approveMilestone(projectId, 0)
+      ).to.be.revertedWith("Milestone not submitted");
+    });
+
+  });
+
+  // -------------------------------------------------------
+  // 5. CLAIM EXPIRED
+  // -------------------------------------------------------
+  describe("claimExpired", function () {
+
+    it("refunds client and marks milestone EXPIRED", async function () {
+      const projectId = await createProject();
+
+      // advance time past the first milestone deadline (7 days)
+      await time.increase(8 * 24 * 60 * 60);
+
+      await escrow.connect(client).claimExpired(projectId, 0);
+
+      const milestone = await escrow.getMilestone(projectId, 0);
+      expect(milestone.status).to.equal(3); // 3 = EXPIRED
+      expect(milestone.isPaid).to.equal(true);
+    });
+
+    it("transfers correct refund amount to client", async function () {
+      const projectId = await createProject();
+      await time.increase(8 * 24 * 60 * 60);
+
+      const before = await ethers.provider.getBalance(client.address);
+      const tx = await escrow.connect(client).claimExpired(projectId, 0);
+      const receipt = await tx.wait();
+      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
+      const after = await ethers.provider.getBalance(client.address);
+
+      // client got amounts[0] back minus gas
+      expect(after - before + gasUsed).to.equal(amounts[0]);
+    });
+
+    it("emits MilestoneExpired event", async function () {
+      const projectId = await createProject();
+      await time.increase(8 * 24 * 60 * 60);
+
+      await expect(
+        escrow.connect(client).claimExpired(projectId, 0)
+      ).to.emit(escrow, "MilestoneExpired")
+        .withArgs(projectId, 0, amounts[0]);
+    });
+
+    it("can claim a SUBMITTED milestone that passed its deadline", async function () {
+      const projectId = await createProject();
+
+      // freelancer submits but client never approves
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+
+      // deadline passes
+      await time.increase(8 * 24 * 60 * 60);
+
+      // client reclaims — submitted milestone can also expire
+      await expect(
+        escrow.connect(client).claimExpired(projectId, 0)
+      ).to.emit(escrow, "MilestoneExpired");
+    });
+
+    it("reverts if deadline has not passed", async function () {
+      const projectId = await createProject();
+
+      // do NOT advance time — deadline still in the future
+      await expect(
+        escrow.connect(client).claimExpired(projectId, 0)
+      ).to.be.revertedWith("Deadline has not passed");
+    });
+
+    it("reverts if milestone is already approved", async function () {
+      const projectId = await createProject();
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+      await escrow.connect(client).approveMilestone(projectId, 0);
+
+      await time.increase(8 * 24 * 60 * 60);
+
+      await expect(
+        escrow.connect(client).claimExpired(projectId, 0)
+      ).to.be.revertedWith("Milestone already resolved");
+    });
+
+    it("reverts if called by the freelancer", async function () {
+      const projectId = await createProject();
+      await time.increase(8 * 24 * 60 * 60);
+
+      await expect(
+        escrow.connect(freelancer).claimExpired(projectId, 0)
+      ).to.be.revertedWithCustomError(escrow, "NotAuthorized");
+    });
+
+    it("reverts if called twice on same milestone", async function () {
+      const projectId = await createProject();
+      await time.increase(8 * 24 * 60 * 60);
+
+      await escrow.connect(client).claimExpired(projectId, 0);
+
+      await expect(
+        escrow.connect(client).claimExpired(projectId, 0)
+      ).to.be.revertedWith("Milestone already resolved");
+    });
+
+    it("closes project when last milestone expires", async function () {
+      const projectId = await createProject();
+
+      // approve first two milestones normally
+      for (let i = 0; i < 2; i++) {
+        await escrow.connect(freelancer).submitMilestone(projectId, i);
+        await escrow.connect(client).approveMilestone(projectId, i);
+      }
+
+      // let the third milestone expire
+      await time.increase(22 * 24 * 60 * 60);
+      await escrow.connect(client).claimExpired(projectId, 2);
+
+      const project = await escrow.getProject(projectId);
+      expect(project.isActive).to.equal(false);
+    });
+
+  });
+
+  // -------------------------------------------------------
+  // 6. PAUSE AND UNPAUSE
+  // -------------------------------------------------------
+  describe("Pause", function () {
+
+    it("owner can pause the contract", async function () {
+      await escrow.connect(owner).pause();
+      expect(await escrow.paused()).to.equal(true);
+    });
+
+    it("owner can unpause the contract", async function () {
+      await escrow.connect(owner).pause();
+      await escrow.connect(owner).unpause();
+      expect(await escrow.paused()).to.equal(false);
+    });
+
+    it("blocks createProject when paused", async function () {
+      await escrow.connect(owner).pause();
+      const deadlines = await getDeadlines();
+
+      await expect(
+        escrow.connect(client).createProject(
+          freelancer.address,
+          descriptions,
+          amounts,
+          deadlines,
+          { value: totalBudget }
+        )
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+    });
+
+    it("blocks submitMilestone when paused", async function () {
+      const projectId = await createProject();
+      await escrow.connect(owner).pause();
+
+      await expect(
+        escrow.connect(freelancer).submitMilestone(projectId, 0)
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+    });
+
+    it("blocks approveMilestone when paused", async function () {
+      const projectId = await createProject();
+      await escrow.connect(freelancer).submitMilestone(projectId, 0);
+      await escrow.connect(owner).pause();
+
+      await expect(
+        escrow.connect(client).approveMilestone(projectId, 0)
+      ).to.be.revertedWithCustomError(escrow, "EnforcedPause");
+    });
+
+    it("reverts if stranger tries to pause", async function () {
+      await expect(
+        escrow.connect(stranger).pause()
+      ).to.be.revertedWithCustomError(escrow, "OwnableUnauthorizedAccount");
+    });
+
+  });
+
+  // -------------------------------------------------------
+  // 7. VIEW FUNCTIONS
+  // -------------------------------------------------------
+  describe("View functions", function () {
+
+    it("getProject returns correct data", async function () {
+      const projectId = await createProject();
+      const project = await escrow.getProject(projectId);
+
+      expect(project.client).to.equal(client.address);
+      expect(project.freelancer).to.equal(freelancer.address);
+      expect(project.totalBudget).to.equal(totalBudget);
+      expect(project.isActive).to.equal(true);
+    });
+
+    it("getMilestone returns correct data", async function () {
+      const projectId = await createProject();
+      const milestone = await escrow.getMilestone(projectId, 1);
+
+      expect(milestone.description).to.equal("Frontend build");
+      expect(milestone.amount).to.equal(amounts[1]);
+      expect(milestone.status).to.equal(0); // PENDING
+      expect(milestone.isPaid).to.equal(false);
+    });
+
+    it("milestoneCount equals number of milestones created", async function () {
+      const projectId = await createProject();
+      const project = await escrow.getProject(projectId);
+      expect(project.milestoneCount).to.equal(3);
+    });
+
+  });
+
+});
+```
+
+Save this as `test/FreelanceEscrow.test.ts`.
+
+---
+
+**What is covered:**
+```
+Deployment          → owner set correctly, starts unpaused
+createProject       → happy path, all validation failures
+submitMilestone     → happy path, access control, double submit
+approveMilestone    → payment, budget update, project closure
+claimExpired        → refund, deadline check, double claim
+Pause               → owner control, blocks all functions
+View functions      → data integrity after state changes

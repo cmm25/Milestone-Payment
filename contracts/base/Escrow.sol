@@ -66,6 +66,16 @@ abstract contract EscrowBase is
         _;
     }
 
+    // --- Owner controls ---
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
     // --- Internal helpers ---
 
     // Checks if every milestone in a project has been

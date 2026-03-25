@@ -144,6 +144,11 @@ contract FreelanceEscrow is EscrowBase {
         milestone.isPaid = true;
         _projects[projectId].remainingBudget -= refund;
 
+        if (_allMilestonesResolved(projectId)) {
+            _projects[projectId].isActive = false;
+            emit ProjectCompleted(projectId);
+        }
+
         // interactions
         _transferFunds(_projects[projectId].client, refund);
         emit MilestoneExpired(projectId, milestoneId, refund);
