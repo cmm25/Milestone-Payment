@@ -3,6 +3,7 @@ import hardhatEthers from "@nomicfoundation/hardhat-ethers";
 import hardhatMocha from "@nomicfoundation/hardhat-mocha";
 import hardhatChaiMatchers from "@nomicfoundation/hardhat-ethers-chai-matchers";
 import hardhatNetworkHelpers from "@nomicfoundation/hardhat-network-helpers";
+import hardhatIgnition from "@nomicfoundation/hardhat-ignition-ethers";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -18,6 +19,7 @@ const config: HardhatUserConfig = {
         hardhatMocha,
         hardhatChaiMatchers,
         hardhatNetworkHelpers,
+        hardhatIgnition,
     ],
     solidity: {
         version: "0.8.20",
