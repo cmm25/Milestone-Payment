@@ -10,6 +10,7 @@ interface WalletState {
     chainId: number | null;
     isConnecting: boolean;
     isCorrectChain: boolean;
+    connectError: string | null;
     connect: () => Promise<void>;
     disconnect: () => void;
     switchChain: () => Promise<void>;
@@ -21,6 +22,7 @@ const WalletContext = createContext<WalletState>({
     chainId: null,
     isConnecting: false,
     isCorrectChain: false,
+    connectError: null,
     connect: async () => { },
     disconnect: () => { },
     switchChain: async () => { },
@@ -35,12 +37,14 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     const [signer, setSigner] = useState<ethers.Signer | null>(null);
     const [chainId, setChainId] = useState<number | null>(null);
     const [isConnecting, setIsConnecting] = useState(false);
+    const [connectError, setConnectError] = useState<string | null>(null);
 
     const isCorrectChain = chainId === 31;
 
     const connect = useCallback(async () => {
+        setConnectError(null);
         if (typeof window === "undefined" || !window.ethereum) {
-            alert("Please install MetaMask to use this app.");
+            setConnectError("Please install MetaMask to use this app.");
             return;
         }
         setIsConnecting(true);
@@ -55,6 +59,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
             setChainId(Number(network.chainId));
         } catch (err) {
             console.error("Failed to connect:", err);
+            setConnectError("Connection rejected or failed.");
         } finally {
             setIsConnecting(false);
         }
@@ -122,7 +127,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
     return (
         <WalletContext.Provider
-            value={{ address, signer, chainId, isConnecting, isCorrectChain, connect, disconnect, switchChain }}
+            value={{ address, signer, chainId, isConnecting, isCorrectChain, connectError, connect, disconnect, switchChain }}
         >
             {children}
         </WalletContext.Provider>
