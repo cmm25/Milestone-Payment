@@ -99,7 +99,7 @@ export default function CreateProject() {
       }
     }
 
-    const totalWei = amounts.reduce((a, b) => a + b, 0n);
+    const totalWei = amounts.reduce((a, b) => a + b, BigInt(0));
 
     setLoading(true);
     try {
